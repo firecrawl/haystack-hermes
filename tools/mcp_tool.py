@@ -81,6 +81,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import TypeAdapter
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -125,6 +127,7 @@ try:
     # Notification types for dynamic tool discovery (tools/list_changed)
     try:
         from mcp.types import (
+            ClientNotification,
             ServerNotification,
             ToolListChangedNotification,
             PromptListChangedNotification,
@@ -154,6 +157,10 @@ def _check_message_handler_support() -> bool:
 _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
 if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
     logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
+
+_MCP_NOTIFICATION_ADAPTER = None
+if _MCP_NOTIFICATION_TYPES:
+    _MCP_NOTIFICATION_ADAPTER = TypeAdapter(ServerNotification | ClientNotification)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -344,6 +351,22 @@ def _safe_numeric(value, default, coerce=int, minimum=1):
         return max(result, minimum)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _patch_notification_validator(session):
+    """Allow ClientSession to accept both server and client notification unions.
+
+    The MCP SDK currently validates inbound notifications as
+    ``ServerNotification`` only, but startup may deliver
+    ``notifications/initialized`` as a ``ClientNotification``. Patching the
+    session validator keeps Hermes behavior unchanged while preventing a false
+    startup warning.
+    """
+    if not _MCP_NOTIFICATION_ADAPTER:
+        return session
+    if getattr(session, "_receive_notification_type", None) is ServerNotification:
+        session._receive_notification_type = _MCP_NOTIFICATION_ADAPTER
+    return session
 
 
 class SamplingHandler:
@@ -766,7 +789,9 @@ class MCPServerTask:
                 if isinstance(message, Exception):
                     logger.debug("MCP message handler (%s): exception: %s", self.name, message)
                     return
-                if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
+                if _MCP_NOTIFICATION_TYPES and isinstance(
+                    message, (ServerNotification, ClientNotification)
+                ):
                     match message.root:
                         case ToolListChangedNotification():
                             logger.info(
@@ -843,7 +868,9 @@ class MCPServerTask:
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
         async with stdio_client(server_params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+            session = ClientSession(read_stream, write_stream, **sampling_kwargs)
+            session = _patch_notification_validator(session)
+            async with session:
                 await session.initialize()
                 self.session = session
                 await self._discover_tools()
@@ -896,7 +923,9 @@ class MCPServerTask:
                 async with streamable_http_client(url, http_client=http_client) as (
                     read_stream, write_stream, _get_session_id,
                 ):
-                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                    session = ClientSession(read_stream, write_stream, **sampling_kwargs)
+                    session = _patch_notification_validator(session)
+                    async with session:
                         await session.initialize()
                         self.session = session
                         await self._discover_tools()
@@ -913,7 +942,9 @@ class MCPServerTask:
             async with streamablehttp_client(url, **_http_kwargs) as (
                 read_stream, write_stream, _get_session_id,
             ):
-                async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                session = ClientSession(read_stream, write_stream, **sampling_kwargs)
+                session = _patch_notification_validator(session)
+                async with session:
                     await session.initialize()
                     self.session = session
                     await self._discover_tools()

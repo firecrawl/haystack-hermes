@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tools.mcp_tool import MCPServerTask, _register_server_tools
+from tools.mcp_tool import (
+    MCPServerTask,
+    _patch_notification_validator,
+    _register_server_tools,
+)
 from tools.registry import ToolRegistry
 
 
@@ -105,6 +109,46 @@ class TestRefreshTools:
         assert server._registered_tool_names == ["mcp_live_srv_new_tool"]
 
 
+class TestNotificationValidation:
+    """Tests for session notification validation patching."""
+
+    def test_patches_session_to_accept_client_notifications(self):
+        from mcp.types import ClientNotification, InitializedNotification, ServerNotification
+
+        session = SimpleNamespace(_receive_notification_type=ServerNotification)
+        patched = _patch_notification_validator(session)
+
+        message = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        validated = patched._receive_notification_type.validate_python(message)
+
+        assert patched is session
+        assert isinstance(validated, ClientNotification)
+        assert isinstance(validated.root, InitializedNotification)
+
+    def test_validator_accepts_server_and_client_notification_unions(self):
+        from mcp.types import (
+            ClientNotification,
+            InitializedNotification,
+            ServerNotification,
+            ToolListChangedNotification,
+        )
+
+        session = SimpleNamespace(_receive_notification_type=ServerNotification)
+        patched = _patch_notification_validator(session)
+
+        initialized = patched._receive_notification_type.validate_python(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+        tool_list_changed = patched._receive_notification_type.validate_python(
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        )
+
+        assert isinstance(initialized, ClientNotification)
+        assert isinstance(initialized.root, InitializedNotification)
+        assert isinstance(tool_list_changed, ServerNotification)
+        assert isinstance(tool_list_changed.root, ToolListChangedNotification)
+
+
 class TestMessageHandler:
     """Tests for MCPServerTask._make_message_handler dispatch."""
 
@@ -114,7 +158,12 @@ class TestMessageHandler:
         if not _MCP_NOTIFICATION_TYPES:
             pytest.skip("MCP SDK ToolListChangedNotification not available")
 
-        from mcp.types import ServerNotification, ToolListChangedNotification
+        from mcp.types import (
+            ClientNotification,
+            InitializedNotification,
+            ServerNotification,
+            ToolListChangedNotification,
+        )
 
         server = MCPServerTask("notif_srv")
         with patch.object(MCPServerTask, "_refresh_tools", new_callable=AsyncMock) as mock_refresh:
@@ -124,6 +173,13 @@ class TestMessageHandler:
             )
             await handler(notification)
             mock_refresh.assert_awaited_once()
+
+            mock_refresh.reset_mock()
+            initialized = ClientNotification(
+                root=InitializedNotification(method="notifications/initialized")
+            )
+            await handler(initialized)
+            mock_refresh.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ignores_exceptions_and_other_messages(self):
