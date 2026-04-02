@@ -1,0 +1,79 @@
+name: Sync Upstream Hermes
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * *"
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "firecrawlagent"
+          git config user.email "agent@sideguide.dev"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+      - name: Merge upstream/main
+        id: merge
+        run: |
+          set -e
+          BEFORE="$(git rev-parse HEAD)"
+          if git merge --no-ff --no-edit upstream/main; then
+            AFTER="$(git rev-parse HEAD)"
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            exit 0
+          fi
+
+      - name: Push merged main
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git push origin HEAD:main
+
+      - name: Write conflict issue body
+        if: steps.merge.outputs.conflict == 'true'
+        run: |
+          cat > /tmp/upstream-sync-conflict.md <<'EOF'
+          Upstream sync from `NousResearch/hermes-agent:main` into `firecrawl/haystack-hermes:main` hit a merge conflict.
+
+          Manual action needed.
+
+          Suggested local recovery:
+          ```bash
+          cd ~/src/hermes-agent
+          git fetch upstream
+          git checkout main
+          git pull --ff-only origin main
+          git merge upstream/main
+          ```
+          EOF
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Upstream sync conflict in haystack-hermes"
+          content-filepath: /tmp/upstream-sync-conflict.md
