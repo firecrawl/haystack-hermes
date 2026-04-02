@@ -85,6 +85,7 @@ _hermes_home = get_hermes_home()
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.config import save_env_value
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -2451,8 +2452,7 @@ class GatewayRunner:
         # One-time prompt if no home channel is set for this platform
         if not history and source.platform and source.platform != Platform.LOCAL:
             platform_name = source.platform.value
-            env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-            if not os.getenv(env_key):
+            if not self.config.get_home_channel(source.platform):
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     await adapter.send(
@@ -3382,27 +3382,36 @@ class GatewayRunner:
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
         source = event.source
-        platform_name = source.platform.value if source.platform else "unknown"
+        if not source.platform:
+            return "Failed to save home channel: unknown platform"
+
+        platform = source.platform
+        platform_name = platform.value
         chat_id = source.chat_id
         chat_name = source.chat_name or chat_id
-        
+
         env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-        
-        # Save to config.yaml
+        env_name_key = f"{platform_name.upper()}_HOME_CHANNEL_NAME"
+
         try:
-            import yaml
-            config_path = _hermes_home / 'config.yaml'
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config[env_key] = chat_id
-            atomic_yaml_write(config_path, user_config)
-            # Also set in the current environment so it takes effect immediately
+            save_env_value(env_key, str(chat_id))
+            save_env_value(env_name_key, str(chat_name))
             os.environ[env_key] = str(chat_id)
+            os.environ[env_name_key] = str(chat_name)
+
+            platform_config = self.config.platforms.get(platform)
+            if platform_config is None:
+                platform_config = self.config.platforms[platform] = PlatformConfig()
+            platform_config.home_channel = self.config.get_home_channel(platform) or HomeChannel(
+                platform=platform,
+                chat_id=str(chat_id),
+                name=str(chat_name),
+            )
+            platform_config.home_channel.chat_id = str(chat_id)
+            platform_config.home_channel.name = str(chat_name)
         except Exception as e:
             return f"Failed to save home channel: {e}"
-        
+
         return (
             f"✅ Home channel set to **{chat_name}** (ID: {chat_id}).\n"
             f"Cron jobs and cross-platform messages will be delivered here."

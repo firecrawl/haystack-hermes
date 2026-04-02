@@ -164,6 +164,28 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_app_mention(event, say):
                 pass
 
+            # Acknowledge shared-app event subscriptions we intentionally do not
+            # handle so Bolt returns 200 and keeps existing behavior unchanged.
+            shared_app_noop_events = (
+                "user_change",
+                "reaction_added",
+                "reaction_removed",
+                "member_joined_channel",
+                "member_left_channel",
+                "file_shared",
+                "file_change",
+                "channel_created",
+                "channel_archive",
+                "channel_rename",
+                "channel_unarchive",
+                "team_join",
+                "pin_added",
+                "pin_removed",
+            )
+
+            for event_name in shared_app_noop_events:
+                self._app.event(event_name)(self._handle_noop_shared_app_event)
+
             # Register slash command handler
             @self._app.command("/hermes")
             async def handle_hermes_command(ack, command):
@@ -314,6 +336,11 @@ class SlackAdapter(BasePlatformAdapter):
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
 
+    async def _handle_noop_shared_app_event(self, event, say=None, ack=None, logger=None):
+        """Acknowledge shared-app events we subscribe to but do not handle."""
+        if ack is not None:
+            await ack()
+
     def _resolve_thread_ts(
         self,
         reply_to: Optional[str] = None,
@@ -322,6 +349,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Resolve the correct thread_ts for a Slack API call.
 
         Prefers metadata thread_id (the thread parent's ts, set by the
+
         gateway) over reply_to (which may be a child message's ts).
         """
         if metadata:
