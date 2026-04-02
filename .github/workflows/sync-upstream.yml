@@ -27,6 +27,7 @@ jobs:
 
       - name: Add upstream and fetch
         run: |
+          git remote remove upstream || true
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch upstream main
 
