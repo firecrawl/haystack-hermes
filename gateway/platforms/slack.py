@@ -13,7 +13,16 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Optional, Any
+from dataclasses import dataclass
+from typing import Dict, Optional, Any, List, Callable
+
+try:
+    from slack_sdk.errors import SlackApiError
+except ImportError:  # pragma: no cover - slack SDK absent in some test envs
+    class SlackApiError(Exception):
+        def __init__(self, message: str = "", response: Optional[Dict[str, Any]] = None):
+            super().__init__(message)
+            self.response = response or {}
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -42,6 +51,343 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+
+_SLACK_TEXT_LIMIT = 3000
+_SLACK_BLOCK_TEXT_LIMIT = 2800
+_SLACK_FALLBACK_SUMMARY_LIMIT = 240
+_SLACK_SIZE_ERROR_CODES = {"invalid_blocks", "msg_too_long", "invalid_arguments"}
+
+
+@dataclass
+class _SlackRichTextSpan:
+    text: str
+    bold: bool = False
+    italic: bool = False
+    code: bool = False
+
+
+@dataclass
+class _SlackRichTextBlock:
+    type: str
+    text: str = ""
+    spans: Optional[List[_SlackRichTextSpan]] = None
+    items: Optional[List[List[_SlackRichTextSpan]]] = None
+    style: Optional[str] = None
+    label: str = ""
+
+
+def _normalize_slack_text(value: str) -> str:
+    return str(value or "").replace("\r\n", "\n").strip()
+
+
+def _parse_inline_spans(text: str) -> List[_SlackRichTextSpan]:
+    source = str(text or "")
+    if not source:
+        return []
+
+    spans: List[_SlackRichTextSpan] = []
+    cursor = 0
+    length = len(source)
+
+    while cursor < length:
+        start = None
+        token_type = None
+        token_marker = None
+
+        for marker, kind in (("`", "code"), ("*", "bold"), ("_", "italic")):
+            idx = source.find(marker, cursor)
+            if idx != -1 and (start is None or idx < start):
+                start = idx
+                token_type = kind
+                token_marker = marker
+
+        if start is None:
+            spans.append(_SlackRichTextSpan(text=source[cursor:]))
+            break
+
+        if start > cursor:
+            spans.append(_SlackRichTextSpan(text=source[cursor:start]))
+
+        end = source.find(token_marker, start + 1)
+        if end == -1:
+            spans.append(_SlackRichTextSpan(text=source[start:]))
+            break
+
+        inner = source[start + 1:end]
+        if token_type == "code":
+            spans.append(_SlackRichTextSpan(text=inner, code=True))
+        elif token_type == "bold":
+            spans.append(_SlackRichTextSpan(text=inner, bold=True))
+        else:
+            spans.append(_SlackRichTextSpan(text=inner, italic=True))
+        cursor = end + 1
+
+    return [span for span in spans if span.text]
+
+
+def _spans_to_slack_elements(spans: List[_SlackRichTextSpan]) -> List[Dict[str, Any]]:
+    elements: List[Dict[str, Any]] = []
+    for span in spans:
+        style: Dict[str, Any] = {}
+        if span.bold:
+            style["bold"] = True
+        if span.italic:
+            style["italic"] = True
+        if span.code:
+            style["code"] = True
+        element: Dict[str, Any] = {"type": "text", "text": span.text}
+        if style:
+            element["style"] = style
+        elements.append(element)
+    return elements
+
+
+def _parse_slack_rich_text_blocks(value: str) -> List[_SlackRichTextBlock]:
+    source = _normalize_slack_text(value)
+    if not source:
+        return []
+
+    lines = source.split("\n")
+    blocks: List[_SlackRichTextBlock] = []
+    paragraph_lines: List[str] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph_lines
+        if not paragraph_lines:
+            return
+        text = " ".join(part.strip() for part in paragraph_lines if part.strip()).strip()
+        if text:
+            blocks.append(_SlackRichTextBlock(type="paragraph", spans=_parse_inline_spans(text)))
+        paragraph_lines = []
+
+    index = 0
+    while index < len(lines):
+        line = lines[index].rstrip()
+        stripped = line.strip()
+        if not stripped:
+            flush_paragraph()
+            index += 1
+            continue
+
+        fenced_start = re.match(r"^```(.*)$", stripped)
+        if fenced_start:
+            flush_paragraph()
+            language = (fenced_start.group(1) or "").strip()
+            code_lines: List[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                code_lines.append(lines[index])
+                index += 1
+            code_text = "\n".join(code_lines).strip("\n")
+            blocks.append(
+                _SlackRichTextBlock(
+                    type="preformatted",
+                    text=f"{language}\n{code_text}".strip() if language else code_text,
+                )
+            )
+            index += 1
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading_match:
+            flush_paragraph()
+            blocks.append(
+                _SlackRichTextBlock(
+                    type="heading",
+                    spans=[_SlackRichTextSpan(text=heading_match.group(2).strip(), bold=True)],
+                )
+            )
+            index += 1
+            continue
+
+        bullet_match = re.match(r"^(?:[-•]|(?<!\*)\*(?!\*))\s+(.+)$", stripped)
+        if bullet_match:
+            flush_paragraph()
+            items = [_parse_inline_spans(bullet_match.group(1).strip())]
+            index += 1
+            while index < len(lines):
+                next_line = lines[index].strip()
+                next_match = re.match(r"^[-*•]\s+(.+)$", next_line)
+                if not next_match:
+                    break
+                items.append(_parse_inline_spans(next_match.group(1).strip()))
+                index += 1
+            blocks.append(_SlackRichTextBlock(type="list", style="bullet", items=items))
+            continue
+
+        numbered_match = re.match(r"^(\d+)[.)]\s+(.+)$", stripped)
+        if numbered_match:
+            flush_paragraph()
+            items = [_parse_inline_spans(numbered_match.group(2).strip())]
+            index += 1
+            while index < len(lines):
+                next_line = lines[index].strip()
+                next_match = re.match(r"^(\d+)[.)]\s+(.+)$", next_line)
+                if not next_match:
+                    break
+                items.append(_parse_inline_spans(next_match.group(2).strip()))
+                index += 1
+            blocks.append(_SlackRichTextBlock(type="list", style="ordered", items=items))
+            continue
+
+        label_match = re.match(r"^([A-Za-z][A-Za-z0-9 /&()_-]{1,40}:)\s*(.+)?$", stripped)
+        if label_match:
+            flush_paragraph()
+            label = label_match.group(1).strip()
+            trailing_text = (label_match.group(2) or "").strip()
+            spans = [_SlackRichTextSpan(text=label, bold=True)]
+            if trailing_text:
+                spans.append(_SlackRichTextSpan(text=" "))
+                spans.extend(_parse_inline_spans(trailing_text))
+            blocks.append(_SlackRichTextBlock(type="label", spans=spans, label=label))
+            index += 1
+            continue
+
+        paragraph_lines.append(stripped)
+        index += 1
+
+    flush_paragraph()
+    return blocks
+
+
+def _slack_blocks_to_mrkdwn(parsed: List[_SlackRichTextBlock]) -> str:
+    parts: List[str] = []
+    for block in parsed:
+        if block.type in {"heading", "paragraph", "label"} and block.spans:
+            rendered = []
+            for span in block.spans:
+                if span.code:
+                    rendered.append(f"`{span.text}`")
+                elif span.bold:
+                    rendered.append(f"*{span.text}*")
+                elif span.italic:
+                    rendered.append(f"_{span.text}_")
+                else:
+                    rendered.append(span.text)
+            parts.append("".join(rendered).strip())
+        elif block.type == "list" and block.items:
+            for item in block.items:
+                rendered = []
+                for span in item:
+                    if span.code:
+                        rendered.append(f"`{span.text}`")
+                    elif span.bold:
+                        rendered.append(f"*{span.text}*")
+                    elif span.italic:
+                        rendered.append(f"_{span.text}_")
+                    else:
+                        rendered.append(span.text)
+                marker = "•" if (block.style or "bullet") == "bullet" else "1."
+                parts.append(f"{marker} {''.join(rendered).strip()}")
+        elif block.type == "preformatted":
+            parts.append(f"```{block.text}```")
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _truncate_slack_block_text(value: str, limit: int = _SLACK_BLOCK_TEXT_LIMIT) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    clipped = text[: max(0, limit - 1)].rstrip()
+    return f"{clipped}…" if clipped else text[:limit]
+
+
+def _build_slack_rich_text_payload(value: str) -> Optional[List[Dict[str, Any]]]:
+    parsed = _parse_slack_rich_text_blocks(value)
+    if not parsed:
+        return None
+
+    mrkdwn_text = _truncate_slack_block_text(_slack_blocks_to_mrkdwn(parsed))
+    elements: List[Dict[str, Any]] = []
+    for block in parsed:
+        if block.type in {"heading", "paragraph", "label"} and block.spans:
+            elements.append({
+                "type": "rich_text_section",
+                "elements": _spans_to_slack_elements(block.spans),
+            })
+        elif block.type == "list" and block.items:
+            elements.append({
+                "type": "rich_text_list",
+                "style": block.style or "bullet",
+                "elements": [
+                    {"type": "rich_text_section", "elements": _spans_to_slack_elements(item)}
+                    for item in block.items
+                ],
+            })
+        elif block.type == "preformatted":
+            elements.append({
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": _truncate_slack_block_text(block.text)}],
+            })
+
+    if not elements:
+        return None
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": mrkdwn_text,
+            },
+        },
+        {
+            "type": "rich_text",
+            "elements": elements,
+        },
+    ]
+
+
+def _is_slack_size_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error_code = str(response.get("error", "")).strip().lower()
+        if error_code in _SLACK_SIZE_ERROR_CODES:
+            return True
+    message = str(exc).lower()
+    return any(code in message for code in _SLACK_SIZE_ERROR_CODES)
+
+
+def _summarize_for_slack_fallback(content: str) -> str:
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if len(text) <= _SLACK_FALLBACK_SUMMARY_LIMIT:
+        return text or "Response too long for Slack formatting; sending plain-text chunks."
+    clipped = text[: _SLACK_FALLBACK_SUMMARY_LIMIT - 1].rstrip()
+    return f"{clipped}…"
+
+
+def _build_slack_fallback_chunks(content: str) -> List[str]:
+    chunks = BasePlatformAdapter.truncate_message(str(content or ""), _SLACK_TEXT_LIMIT)
+    if not chunks:
+        return [""]
+    summary = _summarize_for_slack_fallback(content)
+    if len(chunks) == 1:
+        return chunks
+    return [
+        f"Slack formatting fallback used: {summary}",
+        *chunks,
+    ]
+
+
+async def _send_slack_payload_chunks(
+    *,
+    client: Any,
+    chat_id: str,
+    chunks: List[str],
+    thread_ts: Optional[str],
+    broadcast: bool,
+    payload_builder: Callable[[str], Dict[str, Any]],
+) -> Dict[str, Any]:
+    last_result = None
+    for index, chunk in enumerate(chunks):
+        payload = payload_builder(chunk)
+        payload["channel"] = chat_id
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+            if broadcast and index == 0:
+                payload["reply_broadcast"] = True
+        last_result = await client.chat_postMessage(**payload)
+    return last_result or {}
 
 
 def check_slack_requirements() -> bool:
@@ -245,68 +591,149 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        client = self._get_client(chat_id)
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, _SLACK_TEXT_LIMIT)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        broadcast = self.config.extra.get("reply_broadcast", False)
+
+        def _formatted_payload(chunk: str) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {"text": chunk}
+            rich_text_blocks = _build_slack_rich_text_payload(chunk)
+            if rich_text_blocks:
+                payload["blocks"] = rich_text_blocks
+            return payload
+
+        def _plain_payload(chunk: str) -> Dict[str, Any]:
+            return {"text": chunk}
+
         try:
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
-
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            last_result = None
-
-            # reply_broadcast: also post thread replies to the main channel.
-            # Controlled via platform config: gateway.slack.reply_broadcast
-            broadcast = self.config.extra.get("reply_broadcast", False)
-
-            for i, chunk in enumerate(chunks):
-                kwargs = {
-                    "channel": chat_id,
-                    "text": chunk,
-                }
-                if thread_ts:
-                    kwargs["thread_ts"] = thread_ts
-                    # Only broadcast the first chunk of the first reply
-                    if broadcast and i == 0:
-                        kwargs["reply_broadcast"] = True
-
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
-
+            last_result = await _send_slack_payload_chunks(
+                client=client,
+                chat_id=chat_id,
+                chunks=chunks,
+                thread_ts=thread_ts,
+                broadcast=broadcast,
+                payload_builder=_formatted_payload,
+            )
             return SendResult(
                 success=True,
                 message_id=last_result.get("ts") if last_result else None,
                 raw_response=last_result,
             )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if not _is_slack_size_error(exc):
+                logger.error("[Slack] Send error: %s", exc, exc_info=True)
+                return SendResult(success=False, error=str(exc))
 
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Send error: %s", e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            response = getattr(exc, "response", {}) or {}
+            error_code = str(response.get("error", "unknown")).strip() or "unknown"
+            logger.warning(
+                "[Slack] Formatted send rejected due to Slack size/schema limits (%s)",
+                error_code,
+            )
+            fallback_chunks = _build_slack_fallback_chunks(formatted)
+            logger.info(
+                "[Slack] Fallback chunking path used (%d messages)",
+                len(fallback_chunks),
+            )
+            try:
+                last_result = await _send_slack_payload_chunks(
+                    client=client,
+                    chat_id=chat_id,
+                    chunks=fallback_chunks,
+                    thread_ts=thread_ts,
+                    broadcast=broadcast,
+                    payload_builder=_plain_payload,
+                )
+                return SendResult(
+                    success=True,
+                    message_id=last_result.get("ts") if last_result else None,
+                    raw_response=last_result,
+                )
+            except Exception as fallback_exc:
+                logger.error("[Slack] Fallback send error: %s", fallback_exc, exc_info=True)
+                return SendResult(success=False, error=str(fallback_exc))
 
     async def edit_message(
         self,
         chat_id: str,
         message_id: str,
         content: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Slack message."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
+
+        client = self._get_client(chat_id)
+        formatted = self.format_message(content)
+        chunked = self.truncate_message(formatted, _SLACK_TEXT_LIMIT)
+        primary_chunk = chunked[0] if chunked else ""
+        parent_thread_ts = self._resolve_thread_ts(None, metadata)
+
+        update_payload: Dict[str, Any] = {
+            "channel": chat_id,
+            "ts": message_id,
+            "text": primary_chunk,
+        }
+        blocks = _build_slack_rich_text_payload(primary_chunk)
+        if blocks:
+            update_payload["blocks"] = blocks
+
+        async def _post_followups(extra_chunks: List[str]) -> None:
+            reply_thread_ts = parent_thread_ts or message_id
+            for extra_chunk in extra_chunks:
+                payload = {"channel": chat_id, "text": extra_chunk}
+                if reply_thread_ts:
+                    payload["thread_ts"] = reply_thread_ts
+                await client.chat_postMessage(**payload)
+
         try:
-            await self._get_client(chat_id).chat_update(
-                channel=chat_id,
-                ts=message_id,
-                text=content,
+            await client.chat_update(**update_payload)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            if not _is_slack_size_error(exc):
+                logger.error(
+                    "[Slack] Failed to edit message %s in channel %s: %s",
+                    message_id,
+                    chat_id,
+                    exc,
+                    exc_info=True,
+                )
+                return SendResult(success=False, error=str(exc))
+
+            response = getattr(exc, "response", {}) or {}
+            error_code = str(response.get("error", "unknown")).strip() or "unknown"
+            logger.warning(
+                "[Slack] Formatted send rejected due to Slack size/schema limits (%s)",
+                error_code,
             )
+            fallback_chunks = _build_slack_fallback_chunks(formatted)
+            logger.info(
+                "[Slack] Fallback chunking path used (%d messages)",
+                len(fallback_chunks),
+            )
+            plain_update = {
+                "channel": chat_id,
+                "ts": message_id,
+                "text": fallback_chunks[0],
+            }
+            try:
+                await client.chat_update(**plain_update)
+            except Exception as fallback_exc:
+                logger.error(
+                    "[Slack] Failed to edit message %s in channel %s: %s",
+                    message_id,
+                    chat_id,
+                    fallback_exc,
+                    exc_info=True,
+                )
+                return SendResult(success=False, error=str(fallback_exc))
+            await _post_followups(fallback_chunks[1:])
             return SendResult(success=True, message_id=message_id)
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error(
-                "[Slack] Failed to edit message %s in channel %s: %s",
-                message_id,
-                chat_id,
-                e,
-                exc_info=True,
-            )
-            return SendResult(success=False, error=str(e))
+
+        await _post_followups(chunked[1:])
+        return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.

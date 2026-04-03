@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import time
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,9 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
 _VOICE_EXTS = {".ogg", ".opus"}
+_SLACK_TEXT_LIMIT = 3000
+_SLACK_FALLBACK_SUMMARY_LIMIT = 240
+_SLACK_SIZE_ERROR_CODES = {"invalid_blocks", "msg_too_long", "invalid_arguments"}
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -229,6 +233,37 @@ def _describe_media_for_mirror(media_files):
     return f"[Sent {len(media_files)} media attachments]"
 
 
+def _is_slack_size_error_payload(payload: Dict[str, Any]) -> bool:
+    error_code = str(payload.get("error", "")).strip().lower()
+    if error_code in _SLACK_SIZE_ERROR_CODES:
+        return True
+    message = str(payload.get("detail") or payload.get("message") or "").lower()
+    return any(code in message for code in _SLACK_SIZE_ERROR_CODES)
+
+
+def _summarize_for_slack_fallback(content: str) -> str:
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if len(text) <= _SLACK_FALLBACK_SUMMARY_LIMIT:
+        return text or "Response too long for Slack formatting; sending plain-text chunks."
+    clipped = text[: _SLACK_FALLBACK_SUMMARY_LIMIT - 1].rstrip()
+    return f"{clipped}…"
+
+
+def _build_slack_fallback_chunks(content: str) -> List[str]:
+    from gateway.platforms.base import BasePlatformAdapter
+
+    chunks = BasePlatformAdapter.truncate_message(str(content or ""), _SLACK_TEXT_LIMIT)
+    if not chunks:
+        return [""]
+    summary = _summarize_for_slack_fallback(content)
+    if len(chunks) == 1:
+        return chunks
+    return [
+        f"Slack formatting fallback used: {summary}",
+        *chunks,
+    ]
+
+
 def _get_cron_auto_delivery_target():
     """Return the cron scheduler's auto-delivery target for the current run, if any."""
     platform = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
@@ -300,7 +335,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
-        Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+        Platform.SLACK: _SLACK_TEXT_LIMIT,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
@@ -350,7 +385,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         if platform == Platform.DISCORD:
             result = await _send_discord(pconfig.token, chat_id, chunk)
         elif platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
+            result = await _send_slack(pconfig.token, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -529,21 +564,63 @@ async def _send_discord(token, chat_id, message):
         return {"error": f"Discord send failed: {e}"}
 
 
-async def _send_slack(token, chat_id, message):
-    """Send via Slack Web API."""
+async def _send_slack(token, chat_id, message, thread_id=None):
+    """Send via Slack Web API with chunking and plain-text fallback for size/schema failures."""
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
     try:
-        url = "https://slack.com/api/chat.postMessage"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        from gateway.platforms.slack import _build_slack_rich_text_payload
+    except Exception as e:
+        return {"error": f"Slack send failed: {e}"}
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    async def _post_payloads(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        last_data: Dict[str, Any] = {}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, headers=headers, json={"channel": chat_id, "text": message}) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
-                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+            for payload in payloads:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        return {"error": data.get("error", "Slack API error"), "detail": data.get("detail"), "payload": payload}
+                    last_data = data
+        return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": last_data.get("ts")}
+
+    def _make_payload(chunk: str, include_blocks: bool) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "channel": chat_id,
+            "text": chunk,
+        }
+        if thread_id is not None:
+            payload["thread_ts"] = thread_id
+        if include_blocks:
+            blocks = _build_slack_rich_text_payload(chunk)
+            if blocks:
+                payload["blocks"] = blocks
+        return payload
+
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        formatted_chunks = BasePlatformAdapter.truncate_message(message, _SLACK_TEXT_LIMIT)
+        result = await _post_payloads([_make_payload(chunk, True) for chunk in formatted_chunks])
+        if result.get("success"):
+            return result
+        if not _is_slack_size_error_payload(result):
+            return result
+
+        logger.warning(
+            "[Slack] Formatted send rejected due to Slack size/schema limits (%s)",
+            result.get("error", "unknown"),
+        )
+        fallback_chunks = _build_slack_fallback_chunks(message)
+        logger.info("[Slack] Fallback chunking path used (%d messages)", len(fallback_chunks))
+        fallback_result = await _post_payloads([_make_payload(chunk, False) for chunk in fallback_chunks])
+        return fallback_result
     except Exception as e:
         return {"error": f"Slack send failed: {e}"}
 

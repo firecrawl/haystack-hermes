@@ -59,7 +59,11 @@ _ensure_slack_mock()
 import gateway.platforms.slack as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
-from gateway.platforms.slack import SlackAdapter  # noqa: E402
+from gateway.platforms.slack import (  # noqa: E402
+    SlackAdapter,
+    _build_slack_rich_text_payload,
+    _SLACK_TEXT_LIMIT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,117 @@ class TestAppMentionHandler:
         assert "message" in registered_events
         assert "app_mention" in registered_events
         assert "/hermes" in registered_commands
+
+
+class TestSlackRichTextFormatting:
+    def test_builds_rich_text_lists_and_inline_styles(self):
+        payload = _build_slack_rich_text_payload(
+            """# Daily standup follow-up digest
+
+- *Acme* — waiting on _security review_
+- Beta — pricing follow-up
+
+Next step: send `nudge` today
+"""
+        )
+
+        assert payload is not None
+        mrkdwn, rich = payload
+        assert mrkdwn["type"] == "section"
+        assert rich["type"] == "rich_text"
+
+        elements = rich["elements"]
+        assert elements[0]["type"] == "rich_text_section"
+        assert elements[0]["elements"][0]["text"] == "Daily standup follow-up digest"
+        assert elements[0]["elements"][0]["style"]["bold"] is True
+
+        bullet_list = next(e for e in elements if e["type"] == "rich_text_list")
+        assert bullet_list["style"] == "bullet"
+        first_item = bullet_list["elements"][0]["elements"]
+        assert first_item[0]["text"] == "Acme"
+        assert first_item[0]["style"]["bold"] is True
+        assert first_item[2]["text"] == "security review"
+        assert first_item[2]["style"]["italic"] is True
+
+        label_section = elements[-1]["elements"]
+        assert label_section[0]["text"] == "Next step:"
+        assert label_section[0]["style"]["bold"] is True
+        assert label_section[2]["text"] == "send "
+        assert label_section[3]["text"] == "nudge"
+        assert label_section[3]["style"]["code"] is True
+
+    def test_truncates_section_text_before_slack_block_limit(self):
+        payload = _build_slack_rich_text_payload("x" * (_SLACK_TEXT_LIMIT + 500))
+        assert payload is not None
+        assert len(payload[0]["text"]["text"]) <= 2800
+
+
+class TestSlackSendBehavior:
+    @pytest.mark.asyncio
+    async def test_oversized_single_response_is_chunked(self, adapter):
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "1"})
+        content = "word " * 1200
+
+        result = await adapter.send("C123", content)
+
+        assert result.success
+        assert adapter._app.client.chat_postMessage.await_count >= 2
+        for call in adapter._app.client.chat_postMessage.await_args_list:
+            assert len(call.kwargs["text"]) <= _SLACK_TEXT_LIMIT + 10
+
+    @pytest.mark.asyncio
+    async def test_fallback_after_invalid_blocks_uses_plain_summary_then_chunks(self, adapter, caplog):
+        error = _slack_mod.SlackApiError("invalid blocks", response={"error": "invalid_blocks"})
+        adapter._app.client.chat_postMessage = AsyncMock(side_effect=[error, {"ts": "2"}, {"ts": "3"}, {"ts": "4"}])
+        content = ("# Heading\n\n" + ("word " * 900)).strip()
+
+        with caplog.at_level("INFO"):
+            result = await adapter.send("C123", content)
+
+        assert result.success
+        assert adapter._app.client.chat_postMessage.await_count == 4
+        fallback_summary = adapter._app.client.chat_postMessage.await_args_list[1].kwargs["text"]
+        assert fallback_summary.startswith("Slack formatting fallback used:")
+        assert "blocks" not in adapter._app.client.chat_postMessage.await_args_list[1].kwargs
+        assert "Formatted send rejected due to Slack size/schema limits (invalid_blocks)" in caplog.text
+        assert "Fallback chunking path used" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fallback_after_msg_too_long_on_edit_posts_extra_chunks(self, adapter, caplog):
+        error = _slack_mod.SlackApiError("too long", response={"error": "msg_too_long"})
+        adapter._app.client.chat_update = AsyncMock(side_effect=[error, {"ts": "base"}])
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "thread"})
+        content = "word " * 1200
+
+        with caplog.at_level("INFO"):
+            result = await adapter.edit_message("C123", "123.456", content)
+
+        assert result.success
+        assert adapter._app.client.chat_update.await_count == 2
+        assert adapter._app.client.chat_postMessage.await_count >= 1
+        first_update = adapter._app.client.chat_update.await_args_list[1].kwargs["text"]
+        assert first_update.startswith("Slack formatting fallback used:")
+        posted = adapter._app.client.chat_postMessage.await_args_list[0].kwargs
+        assert posted["thread_ts"] == "123.456"
+        assert "Formatted send rejected due to Slack size/schema limits (msg_too_long)" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_edit_message_in_existing_thread_uses_parent_thread_ts_for_followups(self, adapter):
+        adapter._app.client.chat_update = AsyncMock(return_value={"ts": "123.456"})
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "thread"})
+        content = "word " * 1200
+
+        result = await adapter.edit_message(
+            "C123",
+            "123.456",
+            content,
+            metadata={"thread_ts": "111.222"},
+        )
+
+        assert result.success
+        assert adapter._app.client.chat_postMessage.await_count >= 1
+        posted = adapter._app.client.chat_postMessage.await_args_list[0].kwargs
+        assert posted["thread_ts"] == "111.222"
 
 
 # ---------------------------------------------------------------------------

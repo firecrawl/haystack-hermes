@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform
-from tools.send_message_tool import _send_telegram, _send_to_platform, send_message_tool
+from tools.send_message_tool import _send_slack, _send_telegram, _send_to_platform, send_message_tool
 
 
 def _run_async_immediately(coro):
@@ -415,6 +415,60 @@ class TestSendToPlatformWhatsapp:
 
         assert result["success"] is True
         async_mock.assert_awaited_once_with({"bridge_port": 3000}, chat_id, "hello from hermes")
+
+
+class TestSendSlackFallback:
+    def test_invalid_blocks_falls_back_to_summary_and_chunks(self):
+        responses = [
+            {"ok": False, "error": "invalid_blocks"},
+            {"ok": True, "ts": "1"},
+            {"ok": True, "ts": "2"},
+            {"ok": True, "ts": "3"},
+        ]
+        posted_payloads = []
+
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self):
+                return self._payload
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, headers=None, json=None):
+                posted_payloads.append(json)
+                return _FakeResponse(responses.pop(0))
+
+        fake_aiohttp = SimpleNamespace(
+            ClientSession=_FakeSession,
+            ClientTimeout=lambda total: SimpleNamespace(total=total),
+        )
+
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}), \
+             patch("gateway.platforms.slack._build_slack_rich_text_payload", return_value=[{"type": "section", "text": {"type": "mrkdwn", "text": "x"}}]):
+            result = asyncio.run(_send_slack("token", "C123", "word " * 1000, thread_id="123.456"))
+
+        assert result["success"] is True
+        assert posted_payloads[0]["thread_ts"] == "123.456"
+        assert "blocks" in posted_payloads[0]
+        assert posted_payloads[1]["text"].startswith("Slack formatting fallback used:")
+        assert "blocks" not in posted_payloads[1]
+        assert posted_payloads[2]["thread_ts"] == "123.456"
 
 
 class TestSendTelegramHtmlDetection:
