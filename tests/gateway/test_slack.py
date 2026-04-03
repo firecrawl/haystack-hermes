@@ -586,20 +586,22 @@ class TestMessageRouting:
         assert len(captured_events) == 1
         msg_event = captured_events[0]
         assert msg_event.source.chat_id == "C_HOME"
-        assert msg_event.source.thread_id is None
+        assert msg_event.source.thread_id == "home_thread_ts"
+        assert msg_event.message_id == "home_thread_ts"
         assert msg_event.raw_message["_rerouted_from_channel"] == "C_OTHER"
         assert msg_event.raw_message["_rerouted_to_home_channel"] == "C_HOME"
+        assert msg_event.raw_message["_rerouted_seed_message_ts"] == "home_thread_ts"
 
-        home_client.chat_postMessage.assert_not_called()
+        home_client.chat_postMessage.assert_called_once_with(
+            channel="C_HOME",
+            text="<@U_USER> asked this in <#C_OTHER>:\n> <@U_BOT> help",
+        )
         adapter._app.client.chat_postMessage.assert_called_once_with(
             channel="C_OTHER",
-            text="I've moved this Hermes conversation to <#C_HOME> to keep this thread clean. Continue here: https://slack.example.com/archives/C_HOME/p123",
+            text="I’m moving this Hermes conversation to <#C_HOME> to keep this thread clean. I’ll answer there in a new thread.",
             thread_ts="1234567890.000001",
         )
-        adapter._app.client.chat_getPermalink.assert_called_once_with(
-            channel="C_HOME",
-            message_ts="1234567890.000001",
-        )
+        adapter._app.client.chat_getPermalink.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_home_channel_mention_stays_in_place(self, adapter):
