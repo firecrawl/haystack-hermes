@@ -760,6 +760,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Determine if this is a DM or channel message
         channel_type = event.get("channel_type", "")
         is_dm = channel_type == "im"
+        home_channel_id = self.config.extra.get("home_channel_id") or os.getenv("SLACK_HOME_CHANNEL", "")
+        should_reroute_to_home = False
+        redirect_notice = None
+        original_channel_id = None
+        original_thread_ts = None
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -778,6 +783,26 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
+
+            if home_channel_id and channel_id != home_channel_id:
+                should_reroute_to_home = True
+                original_channel_id = channel_id
+                original_thread_ts = thread_ts
+                channel_id = home_channel_id
+                thread_ts = None
+                redirect_notice = {
+                    "original_channel_id": original_channel_id,
+                    "original_thread_ts": original_thread_ts,
+                    "original_message_ts": ts,
+                    "home_channel_id": home_channel_id,
+                    "text": text,
+                    "user_id": user_id,
+                }
+                logger.info(
+                    "[Slack] Rerouting mention from channel %s to home channel %s",
+                    original_channel_id,
+                    home_channel_id,
+                )
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -891,10 +916,43 @@ class SlackAdapter(BasePlatformAdapter):
             reply_to_message_id=thread_ts if thread_ts != ts else None,
         )
 
+        if redirect_notice:
+            msg_event.raw_message = dict(event)
+            msg_event.raw_message["_rerouted_from_channel"] = redirect_notice["original_channel_id"]
+            msg_event.raw_message["_rerouted_from_thread_ts"] = redirect_notice["original_thread_ts"]
+            msg_event.raw_message["_rerouted_original_message_ts"] = redirect_notice["original_message_ts"]
+            msg_event.raw_message["_rerouted_to_home_channel"] = redirect_notice["home_channel_id"]
+
         # Add 👀 reaction to acknowledge receipt
         await self._add_reaction(channel_id, ts, "eyes")
 
         await self.handle_message(msg_event)
+
+        if redirect_notice:
+            try:
+                permalink_result = await self._get_client(home_channel_id).chat_getPermalink(
+                    channel=home_channel_id,
+                    message_ts=msg_event.source.thread_id or ts,
+                )
+                permalink = permalink_result.get("permalink", "")
+            except Exception as e:
+                logger.warning("[Slack] Failed to fetch permalink for rerouted thread: %s", e, exc_info=True)
+                permalink = ""
+
+            redirect_text = (
+                f"I've moved this Hermes conversation to <#{home_channel_id}> to keep this thread clean."
+            )
+            if permalink:
+                redirect_text += f" Continue here: {permalink}"
+
+            try:
+                await self._get_client(original_channel_id).chat_postMessage(
+                    channel=original_channel_id,
+                    text=redirect_text,
+                    thread_ts=original_thread_ts or ts,
+                )
+            except Exception as e:
+                logger.warning("[Slack] Failed to post reroute notice in original thread: %s", e, exc_info=True)
 
         # Replace 👀 with ✅ when done
         await self._remove_reaction(channel_id, ts, "eyes")

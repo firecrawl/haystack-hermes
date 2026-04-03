@@ -240,7 +240,14 @@ The default is `true` (threaded replies), which matches the original behavior.
 ## Home Channel
 
 Set `SLACK_HOME_CHANNEL` to a channel ID where Hermes will deliver scheduled messages,
-cron job results, and other proactive notifications. To find a channel ID:
+cron job results, and other proactive notifications.
+
+When `SLACK_HOME_CHANNEL` is set, Slack @mentions in other channels are automatically rerouted:
+- Hermes starts a fresh thread in the home channel for the conversation
+- Hermes replies in the user's original thread with a pointer to the new home-channel thread
+- Mentions made directly in the home channel continue there normally
+
+To find a channel ID:
 
 1. Right-click the channel name in Slack
 2. Click **View channel details**

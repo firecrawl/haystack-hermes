@@ -86,8 +86,8 @@ def _ensure_current_event_loop(request):
         return
 
     try:
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-    except RuntimeError:
+        loop = asyncio.get_event_loop_policy()._local._loop
+    except Exception:
         loop = None
 
     created = loop is None or loop.is_closed()

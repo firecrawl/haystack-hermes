@@ -68,11 +68,16 @@ from gateway.platforms.slack import SlackAdapter  # noqa: E402
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+    config = PlatformConfig(enabled=True, token="***")
     a = SlackAdapter(config)
     # Mock the Slack app client
     a._app = MagicMock()
     a._app.client = AsyncMock()
+    a._app.client.users_info = AsyncMock(
+        return_value={"user": {"profile": {"display_name": "Test User"}}}
+    )
+    a._app.client.reactions_add = AsyncMock()
+    a._app.client.reactions_remove = AsyncMock()
     a._bot_user_id = "U_BOT"
     a._running = True
     # Capture events instead of processing them
@@ -300,6 +305,9 @@ class TestSendVideo:
         adapter._app.client.files_upload_v2 = AsyncMock(
             side_effect=RuntimeError("Slack API error")
         )
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "fallback_ts"}
+        )
 
         # Should fall back to base class (text message)
         result = await adapter.send_video(
@@ -307,6 +315,7 @@ class TestSendVideo:
             video_path=str(video),
         )
 
+        assert result.success
         adapter._app.client.chat_postMessage.assert_called_once()
 
 
@@ -541,6 +550,86 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_rerouted_to_home_channel(self, adapter):
+        """Mentions in non-home channels should continue in the Slack home channel."""
+        adapter.config.extra["home_channel_id"] = "C_HOME"
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "notice_ts"})
+        adapter._app.client.chat_getPermalink = AsyncMock(
+            return_value={"permalink": "https://slack.example.com/archives/C_HOME/p123"}
+        )
+        home_client = AsyncMock()
+        home_client.chat_postMessage = AsyncMock(return_value={"ts": "home_thread_ts"})
+        home_client.reactions_add = AsyncMock()
+        home_client.reactions_remove = AsyncMock()
+        home_client.chat_getPermalink = adapter._app.client.chat_getPermalink
+
+        adapter._get_client = MagicMock(side_effect=lambda chat_id: home_client if chat_id == "C_HOME" else adapter._app.client)
+
+        captured_events = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured_events.append(e))
+
+        event = {
+            "text": "<@U_BOT> help",
+            "user": "U_USER",
+            "channel": "C_OTHER",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+
+        with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="testuser")):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured_events) == 1
+        msg_event = captured_events[0]
+        assert msg_event.source.chat_id == "C_HOME"
+        assert msg_event.source.thread_id is None
+        assert msg_event.raw_message["_rerouted_from_channel"] == "C_OTHER"
+        assert msg_event.raw_message["_rerouted_to_home_channel"] == "C_HOME"
+
+        home_client.chat_postMessage.assert_not_called()
+        adapter._app.client.chat_postMessage.assert_called_once_with(
+            channel="C_OTHER",
+            text="I've moved this Hermes conversation to <#C_HOME> to keep this thread clean. Continue here: https://slack.example.com/archives/C_HOME/p123",
+            thread_ts="1234567890.000001",
+        )
+        adapter._app.client.chat_getPermalink.assert_called_once_with(
+            channel="C_HOME",
+            message_ts="1234567890.000001",
+        )
+
+    @pytest.mark.asyncio
+    async def test_home_channel_mention_stays_in_place(self, adapter):
+        """Mentions already in the home channel should not be rerouted."""
+        adapter.config.extra["home_channel_id"] = "C_HOME"
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
+        adapter._app.client.chat_getPermalink = AsyncMock()
+
+        captured_events = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured_events.append(e))
+
+        event = {
+            "text": "<@U_BOT> help",
+            "user": "U_USER",
+            "channel": "C_HOME",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+
+        with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="testuser")):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured_events) == 1
+        msg_event = captured_events[0]
+        assert msg_event.source.chat_id == "C_HOME"
+        assert msg_event.source.thread_id == "1234567890.000001"
+        assert msg_event.raw_message.get("_rerouted_from_channel") is None
+        adapter._app.client.chat_getPermalink.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
