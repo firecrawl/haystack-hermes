@@ -43,6 +43,12 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+_IGNORED_SLACK_EVENTS = frozenset({
+    "user_change",
+    "file_change",
+    "file_shared",
+    "member_joined_channel",
+})
 
 
 def check_slack_requirements() -> bool:
@@ -174,12 +180,21 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_message_event(event, say):
                 await self._handle_slack_message(event)
 
-            # Acknowledge app_mention events to prevent Bolt 404 errors.
-            # The "message" handler above already processes @mentions in
-            # channels, so this is intentionally a no-op to avoid duplicates.
+            # Route app_mention through the same normalized handler. Slack may
+            # deliver mentions via app_mention without a matching message event.
             @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
-                pass
+            async def handle_app_mention(body, event, say):
+                await self._handle_slack_message(event, body=body)
+
+            # This Slack app is shared with other automations, so explicitly
+            # acknowledge unrelated subscribed events to avoid noisy Bolt 404s.
+            for _event_type in _IGNORED_SLACK_EVENTS:
+                def _make_noop(event_type: str) -> None:
+                    @self._app.event(event_type)
+                    async def _noop(body, logger):
+                        logger.debug("[Slack] Ignoring subscribed event: %s", event_type)
+
+                _make_noop(_event_type)
 
             # Register slash command handler
             @self._app.command("/hermes")
@@ -755,7 +770,35 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Internal handlers -----
 
-    async def _handle_slack_message(self, event: dict) -> None:
+    @staticmethod
+    def _extract_team_id(event: dict, body: Optional[dict] = None) -> str:
+        """Extract a team_id from the event or full Bolt envelope."""
+        team_id = event.get("team", "")
+        if team_id:
+            return team_id
+
+        if not body:
+            return ""
+
+        team_id = body.get("team_id", "")
+        if team_id:
+            return team_id
+
+        authorizations = body.get("authorizations")
+        if isinstance(authorizations, list):
+            for auth in authorizations:
+                if isinstance(auth, dict) and auth.get("team_id"):
+                    return auth["team_id"]
+
+        team = body.get("team")
+        if isinstance(team, dict):
+            return team.get("id", "")
+        if isinstance(team, str):
+            return team
+
+        return ""
+
+    async def _handle_slack_message(self, event: dict, body: Optional[dict] = None) -> None:
         """Handle an incoming Slack message event."""
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
@@ -784,7 +827,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = event.get("user", "")
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
-        team_id = event.get("team", "")
+        team_id = self._extract_team_id(event, body)
 
         # Track which workspace owns this channel
         if team_id and channel_id:

@@ -102,6 +102,7 @@ class TestAppMentionHandler:
 
         # Track which events get registered
         registered_events = []
+        event_handlers = {}
         registered_commands = []
 
         mock_app = MagicMock()
@@ -109,6 +110,7 @@ class TestAppMentionHandler:
         def mock_event(event_type):
             def decorator(fn):
                 registered_events.append(event_type)
+                event_handlers[event_type] = fn
                 return fn
             return decorator
 
@@ -146,6 +148,21 @@ class TestAppMentionHandler:
         assert "message" in registered_events
         assert "app_mention" in registered_events
         assert "/hermes" in registered_commands
+        for event_name in _slack_mod._IGNORED_SLACK_EVENTS:
+            assert event_name in registered_events
+
+        adapter._handle_slack_message = AsyncMock()
+        asyncio.run(
+            event_handlers["app_mention"](
+                {"team_id": "T_FAKE"},
+                {"ts": "123"},
+                None,
+            )
+        )
+        adapter._handle_slack_message.assert_awaited_once_with(
+            {"ts": "123"},
+            body={"team_id": "T_FAKE"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +534,40 @@ class TestMessageRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "what's the weather?"
         assert "<@U_BOT>" not in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_app_mention_uses_body_team_id(self, adapter):
+        """app_mention events should use the Bolt envelope team_id."""
+        event = {
+            "text": "<@U_BOT> yes please",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+
+        await adapter._handle_slack_message(event, body={"team_id": "T_TEAM"})
+
+        assert adapter._channel_team["C123"] == "T_TEAM"
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "yes please"
+
+    @pytest.mark.asyncio
+    async def test_message_and_app_mention_with_same_ts_are_deduped(self, adapter):
+        """Duplicate delivery via message + app_mention should process once."""
+        event = {
+            "text": "<@U_BOT> can you help?",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+            "team": "T_TEAM",
+        }
+
+        await adapter._handle_slack_message(event)
+        await adapter._handle_slack_message(dict(event), body={"team_id": "T_TEAM"})
+
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter):
