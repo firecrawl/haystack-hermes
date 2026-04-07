@@ -17,6 +17,7 @@ HEALTH_CHECK_DELAY="${HEALTH_CHECK_DELAY:-2}"
 SMOKE_CMD="${HERMES_UPDATE_SMOKE_CMD:-}"
 PUSH_REMOTE="${PUSH_REMOTE:-origin}"
 PUSH_BRANCH="${PUSH_BRANCH:-$DEPLOY_BRANCH}"
+FORCE_PUSH_MAIN="${HERMES_UPDATE_FORCE_PUSH_MAIN:-1}"
 
 PYTHON_DEPS=(pyproject.toml requirements.txt uv.lock)
 NODE_DEPS=(package.json package-lock.json)
@@ -60,6 +61,12 @@ push_backup_remote() {
     fi
 
     if [ -z "$PUSH_REMOTE" ]; then
+        return
+    fi
+
+    if [ "$FORCE_PUSH_MAIN" = "1" ] && [ "$DEPLOY_BRANCH" = "main" ] && [ "$PUSH_BRANCH" = "main" ]; then
+        log "Force-pushing $current_head to $PUSH_REMOTE/$PUSH_BRANCH with lease..."
+        git push --force-with-lease "$PUSH_REMOTE" "$DEPLOY_BRANCH:$PUSH_BRANCH"
         return
     fi
 
