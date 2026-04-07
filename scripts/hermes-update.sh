@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="${REPO:-/home/cody/src/hermes-agent}"
 VENV="${VENV:-$REPO/.venv}"
 LOG_TAG="${LOG_TAG:-hermes-update}"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-local/deploy}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 UPSTREAM_REF="${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}"
@@ -12,8 +12,11 @@ LAST_KNOWN_GOOD_REF="${LAST_KNOWN_GOOD_REF:-refs/local/last-known-good}"
 LOCKFILE="${LOCKFILE:-/home/cody/.cache/hermes-update.lock}"
 GATEWAY_SERVICE="${GATEWAY_SERVICE:-hermes-gateway.service}"
 SKIP_RESTART="${HERMES_UPDATE_SKIP_RESTART:-0}"
+SKIP_PUSH="${HERMES_UPDATE_SKIP_PUSH:-0}"
 HEALTH_CHECK_DELAY="${HEALTH_CHECK_DELAY:-2}"
 SMOKE_CMD="${HERMES_UPDATE_SMOKE_CMD:-}"
+PUSH_REMOTE="${PUSH_REMOTE:-origin}"
+PUSH_BRANCH="${PUSH_BRANCH:-$DEPLOY_BRANCH}"
 
 PYTHON_DEPS=(pyproject.toml requirements.txt uv.lock)
 NODE_DEPS=(package.json package-lock.json)
@@ -46,6 +49,22 @@ import gateway.run
 import gateway.platforms.slack
 import hermes_cli.main
 PY
+}
+
+push_backup_remote() {
+    local current_head="$1"
+
+    if [ "$SKIP_PUSH" = "1" ]; then
+        log "Skipping fork sync because HERMES_UPDATE_SKIP_PUSH=1."
+        return
+    fi
+
+    if [ -z "$PUSH_REMOTE" ]; then
+        return
+    fi
+
+    log "Pushing $current_head to $PUSH_REMOTE/$PUSH_BRANCH..."
+    git push "$PUSH_REMOTE" "$DEPLOY_BRANCH:$PUSH_BRANCH"
 }
 
 install_python_deps_if_needed() {
@@ -113,22 +132,22 @@ previous_head="$(git rev-parse HEAD)"
 upstream_head="$(git rev-parse "$UPSTREAM_REF")"
 
 if git merge-base --is-ancestor "$UPSTREAM_REF" HEAD; then
+    current_head="$previous_head"
     log "Deploy branch already contains $UPSTREAM_REF ($upstream_head)."
-    exit 0
+else
+    log "Recording last known good commit: $previous_head"
+    git update-ref "$LAST_KNOWN_GOOD_REF" "$previous_head"
+
+    log "Rebasing $DEPLOY_BRANCH onto $UPSTREAM_REF..."
+    if ! git rebase "$UPSTREAM_REF"; then
+        log "Rebase conflict detected while updating $DEPLOY_BRANCH; aborting without restart."
+        git rebase --abort || true
+        rollback_to_previous "$previous_head"
+        exit 1
+    fi
+
+    current_head="$(git rev-parse HEAD)"
 fi
-
-log "Recording last known good commit: $previous_head"
-git update-ref "$LAST_KNOWN_GOOD_REF" "$previous_head"
-
-log "Merging $UPSTREAM_REF into $DEPLOY_BRANCH..."
-if ! git merge --no-edit "$UPSTREAM_REF"; then
-    log "Merge conflict detected while updating $DEPLOY_BRANCH; aborting without restart."
-    git merge --abort || true
-    rollback_to_previous "$previous_head"
-    exit 1
-fi
-
-current_head="$(git rev-parse HEAD)"
 
 if ! install_python_deps_if_needed "$previous_head" "$current_head"; then
     log "Python dependency installation failed."
@@ -151,6 +170,10 @@ fi
 if [ "$SKIP_RESTART" = "1" ]; then
     log "Skipping gateway restart because HERMES_UPDATE_SKIP_RESTART=1."
     git update-ref "$LAST_KNOWN_GOOD_REF" "$current_head"
+    if ! push_backup_remote "$current_head"; then
+        log "Fork sync failed."
+        exit 1
+    fi
     log "Prepared update at $(git rev-parse --short HEAD): $(git log -1 --format='%s')"
     exit 0
 fi
@@ -172,4 +195,8 @@ if ! systemctl --user is-active --quiet "$GATEWAY_SERVICE"; then
 fi
 
 git update-ref "$LAST_KNOWN_GOOD_REF" "$current_head"
+if ! push_backup_remote "$current_head"; then
+    log "Fork sync failed."
+    exit 1
+fi
 log "Done. Now at $(git rev-parse --short HEAD): $(git log -1 --format='%s')"
