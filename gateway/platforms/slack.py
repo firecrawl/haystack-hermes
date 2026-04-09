@@ -1313,7 +1313,7 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         try:
-            from gateway.session import SessionSource, build_session_key
+            from gateway.session import SessionSource
 
             source = SessionSource(
                 platform=Platform.SLACK,
@@ -1322,20 +1322,8 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 thread_id=thread_ts,
             )
-
-            # Read session isolation settings from the store's config
-            store_cfg = getattr(session_store, "config", None)
-            gspu = getattr(store_cfg, "group_sessions_per_user", True) if store_cfg else True
-            tspu = getattr(store_cfg, "thread_sessions_per_user", False) if store_cfg else False
-
-            session_key = build_session_key(
-                source,
-                group_sessions_per_user=gspu,
-                thread_sessions_per_user=tspu,
-            )
-
-            session_store._ensure_loaded()
-            return session_key in session_store._entries
+            session_key = self._session_key_for_source(source)
+            return session_store.has_session_key(session_key)
         except Exception:
             return False
 

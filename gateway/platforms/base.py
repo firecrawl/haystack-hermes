@@ -598,6 +598,14 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
+
+    def _session_key_for_source(self, source: SessionSource) -> str:
+        """Build the live session key using this adapter's config overrides."""
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
     
     @abstractmethod
     async def connect(self) -> bool:
@@ -1150,11 +1158,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
         
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._session_key_for_source(event.source)
         
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
