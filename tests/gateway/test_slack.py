@@ -22,6 +22,7 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -760,12 +761,17 @@ class TestThreadReplyHandling:
 
     @pytest.fixture()
     def mock_session_store(self):
-        """Create a mock session store with entries dict."""
-        store = MagicMock()
-        store._entries = {}
-        store._ensure_loaded = MagicMock()
-        store.config = MagicMock()
-        store.config.group_sessions_per_user = True
+        """Create a lightweight session store stub for thread lookups."""
+        class SessionStoreStub:
+            def __init__(self):
+                self.active_keys = set()
+                self.checked_keys = []
+
+            def has_session_key(self, session_key):
+                self.checked_keys.append(session_key)
+                return session_key in self.active_keys
+
+        store = SessionStoreStub()
         return store
 
     @pytest.fixture()
@@ -782,12 +788,31 @@ class TestThreadReplyHandling:
         a.set_session_store(mock_session_store)
         return a
 
+    @staticmethod
+    def _thread_session_key(adapter, user_id="U_USER", thread_ts="123.000"):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="group",
+            user_id=user_id,
+            thread_id=thread_ts,
+        )
+        return build_session_key(
+            source,
+            group_sessions_per_user=adapter.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=adapter.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+
     @pytest.mark.asyncio
     async def test_thread_reply_without_mention_no_session_ignored(
         self, adapter_with_session_store, mock_session_store
     ):
         """Thread replies without mention should be ignored if no active session."""
-        mock_session_store._entries = {}  # No active sessions
+        mock_session_store.active_keys = set()
 
         event = {
             "text": "Just replying in the thread",
@@ -806,9 +831,8 @@ class TestThreadReplyHandling:
         self, adapter_with_session_store, mock_session_store
     ):
         """Thread replies without mention should be processed if there's an active session."""
-        # Simulate an active session for this thread
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
-        mock_session_store._entries = {session_key: MagicMock()}
+        session_key = self._thread_session_key(adapter_with_session_store)
+        mock_session_store.active_keys = {session_key}
 
         event = {
             "text": "Follow-up question",
@@ -821,6 +845,7 @@ class TestThreadReplyHandling:
         }
         await adapter_with_session_store._handle_slack_message(event)
         adapter_with_session_store.handle_message.assert_called_once()
+        assert mock_session_store.checked_keys[-1] == session_key
 
         # Verify the text is passed through unchanged (no mention stripping needed)
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
@@ -831,9 +856,8 @@ class TestThreadReplyHandling:
         self, adapter_with_session_store, mock_session_store
     ):
         """Thread replies with @mention should still strip the bot ID."""
-        # Even with a session, mentions should be stripped
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
-        mock_session_store._entries = {session_key: MagicMock()}
+        session_key = self._thread_session_key(adapter_with_session_store)
+        mock_session_store.active_keys = {session_key}
 
         event = {
             "text": "<@U_BOT> thanks for the help",
@@ -852,13 +876,75 @@ class TestThreadReplyHandling:
         assert msg_event.text == "thanks for the help"
 
     @pytest.mark.asyncio
+    async def test_unmentioned_reply_after_bot_participation_processed(
+        self, adapter
+    ):
+        """Replies in threads the bot already joined should be accepted."""
+        adapter._bot_message_ts.add("123.000")
+        adapter._fetch_thread_context = AsyncMock(return_value="")
+
+        event = {
+            "text": "One more thing",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        adapter._fetch_thread_context.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra", "expected_key"),
+        [
+            (
+                {"group_sessions_per_user": True, "thread_sessions_per_user": False},
+                "agent:main:slack:group:C123:123.000",
+            ),
+            (
+                {"group_sessions_per_user": True, "thread_sessions_per_user": True},
+                "agent:main:slack:group:C123:123.000:U_USER",
+            ),
+            (
+                {"group_sessions_per_user": False, "thread_sessions_per_user": False},
+                "agent:main:slack:group:C123:123.000",
+            ),
+        ],
+    )
+    async def test_thread_session_lookup_respects_adapter_isolation_flags(
+        self, adapter_with_session_store, mock_session_store, extra, expected_key
+    ):
+        adapter_with_session_store.config.extra.update(extra)
+        mock_session_store.active_keys = {expected_key}
+
+        event = {
+            "text": "Follow-up question",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        assert mock_session_store.checked_keys[-1] == expected_key
+
+    @pytest.mark.asyncio
     async def test_top_level_message_requires_mention_even_with_session(
         self, adapter_with_session_store, mock_session_store
     ):
         """Top-level channel messages should require mention even if session exists."""
         # Session exists but this is a top-level message (no thread_ts)
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
-        mock_session_store._entries = {session_key: MagicMock()}
+        session_key = self._thread_session_key(adapter_with_session_store)
+        mock_session_store.active_keys = {session_key}
 
         event = {
             "text": "New question without mention",
