@@ -584,6 +584,16 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+
+    def generate_session_key(self, source: SessionSource) -> str:
+        """Public wrapper for the store's canonical session-key builder."""
+        return self._generate_session_key(source)
+
+    def has_session_key(self, session_key: str) -> bool:
+        """Return True if an in-memory session entry exists for ``session_key``."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return session_key in self._entries
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.

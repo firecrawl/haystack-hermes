@@ -768,6 +768,12 @@ class GatewayRunner:
         """Resolve the current session key for a source, honoring gateway config when available."""
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
+                session_key = self.session_store.generate_session_key(source)
+                if isinstance(session_key, str) and session_key:
+                    return session_key
+            except Exception:
+                pass
+            try:
                 session_key = self.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
                     return session_key
